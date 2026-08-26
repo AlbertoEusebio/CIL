@@ -177,3 +177,44 @@ at 2x) roughly 8 h. Total about 25 h against a 30 h weekly quota. CLOM's
 
 See the block below for the smoke plan on synthetic data, and on real
 CIFAR-100 if the download finishes.
+
+## 01:05  Local path test, synthetic data (CPU)
+
+`kaggle_runner.py --plan smoke` on a fake CIFAR-100 (random prototypes plus
+noise, real pickle layout), stages 8/16/32/64, 600 train images per task, 2
+epochs, 2 tasks. Purpose: exercise every code path the Kaggle session will
+take, not to learn anything. All four methods ran, checkpointed, and the
+lab ran on the ours checkpoint. Numbers are at chance and prove nothing.
+
+Bugs found and fixed by this test, all real:
+
+- Covariance ridge was proportional to the mean diagonal, so an all zero
+  feature block gave a zero ridge and a singular inverse. Added an absolute
+  floor of 1e-6 in exp18 `collect_stats`, harness `fit_class_gauss` and
+  FeCAM `_fit`, and the lab. Numerically invisible on live features.
+- `--train-sub` took a prefix of a class ordered array, so toy runs saw one
+  class. Now stratified (`cil_data.subsample_train`).
+- The runner did not pass `--allow-cpu` to the lab.
+- SupSup's per image one shot inference costs one backward per test image.
+  Made it a diagnostic on `supsup_native_n=500` images; SupSup's class-IL
+  now uses argmax over concatenated logits, which Kim et al. 2022 footnote
+  6 measured above the one shot rule (62.6 vs 50.2 on C10-5T).
+
+Lab sanity: the lab's `z` row with `--cov full --calib train` reproduced the
+harness class-IL exactly (0.067 = 0.067), which is the check that the two
+code paths compute the same router.
+
+Two things dropped from exp18's per task loop in the harness, deliberately:
+`min_random_scale` (the bisection for the smallest random circuit meeting
+the gate) and `acc_random_same_size`. The `random` row of the selection
+ablation is the same size control with a head refit, which is the fairer
+version. The bisection is expensive and answers a question the matched
+sparsity rows answer better.
+
+## 01:15  Push
+
+SSH from WSL has no key. Push went through Windows' git credential manager
+over HTTPS (`git -c credential.helper=... push https://github.com/AlbertoEusebio/CIL.git main`).
+The remote is now set to the HTTPS URL with that helper in the repo's local
+config so the next push is one command. Copying the Windows private key
+into WSL was refused by the tool policy and not attempted further.

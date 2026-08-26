@@ -25,8 +25,11 @@ Methods
                No native class-IL inference; reported with our router and
                with concatenated head logits, both labelled.
     supsup     Wortsman et al. NeurIPS 2020. Random frozen weights, per-task
-               learned scores (edge-popup). Class-IL by their one-shot
-               entropy-gradient task inference, and also by our router.
+               learned scores (edge-popup). Class-IL by argmax over the
+               concatenated per-task logits (Kim et al. 2022 measured this
+               above SupSup's own one-shot entropy rule); the one-shot rule
+               is reported as a diagnostic on a subsample, and our router
+               is reported too.
     ours       exp18_masked_circuits: greedy causal ablation per task, masked
                freezing, z-standardised Mahalanobis router. --select swaps
                the selection rule at matched sparsity (causal | magnitude |
@@ -84,6 +87,14 @@ class HCfg:
     # wsn / supsup
     wsn_c: float = 0.5            # fraction of weights each task may use
     supsup_k: float = 0.1         # fraction of weights each task keeps
+    supsup_native_n: int = 500    # SupSup's one-shot entropy-gradient task
+                                  # inference needs one backward pass per
+                                  # image, so it is run on this many test
+                                  # images as a diagnostic row (`native`).
+                                  # SupSup's class-IL number uses argmax
+                                  # over concatenated logits (`no_router`),
+                                  # which Kim et al. 2022 footnote 6 measured
+                                  # as the better rule (62.6 vs 50.2).
     # ours
     select: str = "causal"        # causal | magnitude | learned | random
     rot_extra: int = 0            # H_rot. >0: CLOM/CSI rotation-as-OOD. Each
@@ -625,9 +636,10 @@ class WSN:
             x, y, tt = mixed_test(self.tasks, t)
             L = route_generic(ff, hf, self.stats, spans, x, y, tt)
             nat = self.native_cil(x, y, tt, t)
-            if nat is not None:
-                L["native"] = nat
             rows = per_task_means(L, tt, y, t + 1)
+            if nat is not None:
+                n = nat["n"]
+                rows["native"] = per_task_means({"native": nat}, tt[:n], y[:n], t + 1)["native"]
         else:
             rows = {}
             for s in range(t + 1):
@@ -641,7 +653,9 @@ class WSN:
                     rows.setdefault(r, []).append(
                         {"task_acc": v["task_acc"], "class_acc": v["class_acc"]})
         til = [rows["oracle"][s]["class_acc"] for s in range(t + 1)]
-        key = "native" if "native" in rows else "z"
+        # class-IL rule: SupSup by argmax over concatenated logits (Kim et
+        # al. 2022), WSN, which has no rule of its own, by our z router.
+        key = "no_router" if self.tag == "supsup" else "z"
         cil = [rows[key][s]["class_acc"] for s in range(t + 1)]
         return {"til": til, "cil": cil, "ladder": rows}
 
@@ -674,21 +688,17 @@ class SupSup(WSN):
                 w.copy_((torch.randint(0, 2, w.shape, generator=g) * 2 - 1).float().to(w.device) * std)
 
     def native_cil(self, x, y, tt, t):
+        """SupSup one-shot (Wortsman et al. Eq. 4), per image, on the first
+        supsup_native_n images of the mixed stream. Their per batch version
+        assumes a single task batch, which mixed evaluation does not give."""
+        n = min(self.cfg.supsup_native_n, len(x))
+        if n <= 0:
+            return None
+        x, y, tt = x[:n], y[:n], tt[:n]
         T = t + 1
         pick, cls = [], []
         for b0 in range(0, len(x), 256):
             xb = x[b0:b0 + 256]
-            alpha = torch.full((T,), 1.0 / T, device=x.device, requires_grad=True)
-            self.net.set_alpha(alpha)
-            with torch.enable_grad():
-                lg = self.net(xb)[:, :self.tasks[t]["classes"][1]]
-                p = F.softmax(lg, 1)
-                H = -(p * torch.log(p + 1e-12)).sum(1).sum()
-                gr, = torch.autograd.grad(H, alpha)
-            # SupSup: one alpha per batch (their one-shot setting assumes a
-            # batch from one task). With mixed batches that assumption is
-            # false, so we take the per-image version: a separate entropy
-            # gradient for every image.
             grs = []
             for i in range(len(xb)):
                 a_i = torch.full((T,), 1.0 / T, device=x.device, requires_grad=True)
@@ -713,7 +723,7 @@ class SupSup(WSN):
         self.net.set_task(t)
         return {"task_acc": float((pick == tt).float().mean()),
                 "class_acc": float((cls == y).float().mean()),
-                "pick": pick, "cls": cls}
+                "pick": pick, "cls": cls, "n": n}
 
 
 # =============================================================================
