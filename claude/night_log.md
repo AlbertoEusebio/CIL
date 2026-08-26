@@ -1,0 +1,179 @@
+# Night log, 2026-08-27
+
+One block per action. Hypotheses are written before the run. Where a run
+could not happen, the block says so.
+
+## 00:20  Environment check
+
+What I found, not what the brief said:
+
+- This machine: WSL2, 12 CPU cores, 7 GB RAM, no GPU, no torch installed.
+- No Kaggle API credentials anywhere on the machine (`~/.kaggle`,
+  `/mnt/c/Users/alber/.kaggle`, `KAGGLE_USERNAME`: all absent). So there is
+  no way to start, watch or fetch a Kaggle run from this session. The only
+  Kaggle path is: push code to GitHub, owner opens the notebook and presses
+  Save and Run All. The notebook in the repo was a one line placeholder.
+- The repo held `exp18_masked_circuits.py`, `handover_night.md` and the
+  placeholder notebook. `claude/` (positioning, exp18_explained,
+  working_agreement) is not in the repo. `exp17_resnet_circuits.py`, which
+  exp18 imports for `class_split`, `augment` and `prepare_data`, does not
+  exist anywhere on this machine. exp18 could not run at all as checked in.
+- Built a CPU venv (torch 2.13.0+cpu) in the scratchpad for self tests and
+  toy runs. CIFAR-100 download from toronto.edu runs at about 3 MB/min here.
+
+Consequence, stated once: every GPU number in the brief's phases B, C and D
+is NOT produced tonight. The deliverable is the harness, the baselines, the
+fixed bug, the pre-built hypotheses, a tested resume path, a notebook that
+runs the whole plan unattended, and the literature review. Section 7 of the
+brief says stop when out of quota; effective quota tonight was zero.
+
+## 00:30  Replacing the missing exp17 data module
+
+`cil_data.py`: `class_split`, `prepare_data`, `augment`. Class order is
+`torch.randperm(100)` under `split_seed=1234`. Validation is 50 images per
+class taken from TRAIN with the same generator, 500 per task. Test is never
+used for any decision. Augmentation is random crop (pad 4) plus flip, done
+on device from a CPU generator so runs are reproducible. exp18 now imports
+`cil_data as E17`, one line changed. All 11 exp18 self tests pass.
+
+## 00:40  P6 fix, the no_router tautology
+
+`routing_ladder` in exp18: the `no_router` row concatenated `S["own"]`, our
+own per class `-z` scores, so its argmax was the `z` row's argmax by
+construction. It now concatenates `S["head"]`, the head logits under each
+task's mask. On the toy fixture the two rows now differ (`no_router` 0.344
+against `z` 0.594 after task 1), which they never could before. Also added
+`pick` and `cls` tensors to each ladder row so a caller can break the means
+down per task.
+
+## 00:45  Harness, `cil_harness.py`
+
+One data path, one class order, one evaluation, per task checkpoint and
+resume, wall clock deadline. Methods: `finetune`, `fecam`, `wsn`, `supsup`,
+`ours`. Metrics: `classIL_last`, `classIL_avg`, `taskIL_last`, and F
+decomposed into `F_taskIL` (weight movement only) and `F_classIL` (movement
+plus label space growth), per the P7 rule.
+
+Choices made without asking, and why:
+
+- FeCAM and finetune use standard BN (running stats) and SGD 0.1 cosine wd
+  5e-4. ours, WSN, SupSup use exp18's affine free, stats free BN and Adam
+  1e-3 fixed (IBM's recipe, what exp18 already used). Epochs 300 for all
+  trained methods. FeCAM trains only task 0 (that is the method).
+- WSN: per weight scores, top c=50% per layer, straight through, reused
+  weights get zero gradient. SupSup: signed constant random weights, k=10%
+  per layer, scores only. SupSup's class-IL uses their one shot entropy
+  gradient, per image (their per batch version assumes a single task
+  batch). WSN has no native class-IL rule; it is reported with our z router
+  and with concatenated head logits, both labelled as such.
+- Mixed batch evaluation, `--eval-mixed 1` default. Found while writing the
+  evaluator: with `track_running_stats=False` the network normalises with
+  the test batch, and exp18 evaluated each task's test set in its own
+  batches of 512. The batch statistics then carry the task identity. That
+  is a transductive leak into the oracle row and into the router. The
+  harness now shuffles every seen task's test set into one stream. Every
+  exp18 number in the handover was measured the old way, so the new
+  numbers can be lower and the difference is itself a finding. `--eval-mixed
+  0` reproduces the old behaviour for comparison.
+- Selection rule ablation, `--select` and `--ablate-alternatives`. The
+  causal sweep always runs; magnitude (`outw` top k), learned (sigmoid
+  channel gates trained with an L1 push, weights frozen) and random masks
+  are built with the same per stage sizes on the same trained weights, the
+  head is refit on each, and val and test task-IL are logged per task.
+  `--select magnitude` commits the run to that mask instead, for the full
+  run version of the ablation.
+
+Resume bug caught by the self test: after loading a FeCAM checkpoint the
+backbone was in train mode, so BN used batch statistics while fitting class
+covariances and the resumed run diverged (0.479 against 0.969 on the toy).
+`_fit` now forces eval mode. All five methods now reproduce the accuracy
+matrix exactly (NaN aware comparison) after a simulated kill after task 0.
+
+## 01:00  Routing lab, `routing_lab.py`
+
+Evaluation only, from an `ours` checkpoint, no retraining. Legal because
+the circuits are closed: features under mask m are bitwise what they were
+when task m ended, so fitting a later task's Gaussians inside circuit m's
+space now is the computation task u could have run when its data was
+present.
+
+Hypotheses, stated before any number exists:
+
+- H_cross. Circuit m fails to reject other tasks because it has no model of
+  them. Fitting later tasks' class Gaussians inside space m gives it one.
+  Rows `chain` (first circuit whose nearest class is its own), `pairwise`
+  (every pair decided in the earlier circuit's space), `allspace_min`,
+  `allspace_mean`, `space0` (FeCAM on circuit 0). Prediction: task-id
+  accuracy leaves the 3.3x chance band. Storage is printed per covariance
+  model; `shared` and `diag` are the affordable ones.
+- H_calib. exp18 standardises each class's distance with the mean and std
+  of that class's TRAIN distances after 300 epochs. Train features are
+  tighter than test features, so every test image is far from every class
+  and the winner is decided by how overfit each circuit is. `--calib val`
+  uses the held out slice instead. Prediction: this alone moves task-id.
+  TOOD (2026) reports exactly this recentring effect.
+- H_fecam_cov. Raw per class covariance at 450 samples per class is in
+  FeCAM's bad regime (their Table 4: 14.6 raw, 62.1 with shrinkage and
+  normalisation). `--cov fecam`.
+- `rmd`: relative Mahalanobis against a per task background Gaussian.
+- `batch50`: diagnostic only, routes 50 same task images together. Says
+  whether the per image scores carry any signal.
+- Per task AUROC of the reference score is printed, so "routing is 3.3x
+  chance" can be separated into "scores are uninformative" and "scores are
+  informative but miscalibrated across tasks".
+
+## 01:10  Literature review
+
+`claude/literature_review.md`, written by a sub agent that read the papers
+through alphaXiv, every number tagged VERIFIED with the table named, or
+SECOND-HAND. Main findings that changed what I built:
+
+- CLOM Table 2: SupSup with cross entropy heads has task detection 34.3
+  and CIL 33.1 on C100-10T. That is our 3.3x chance and our 21 to 37. The
+  same masks with CSI training reach 63.7 and 62.1. Post hoc scoring on
+  the cross entropy heads (ODIN) reaches only 43.0. About three quarters
+  of the published fix is training, one quarter is scoring.
+- Rotation as OOD classes is the largest single ingredient: CLOM without it
+  drops task detection 66.8 to 59.5, CIL 60.3 to 50.2.
+- The statistics head line as of August 2026: DPCR 50.24 / 63.21, BiCyc
+  50.6 / 63.2, GATF 52.0 / 64.4 (all VERIFIED). The bar is 50 to 52, not
+  49.5, and the same method moves 5 to 10 points across papers.
+- No paper does causal ablation selection in continual learning and none
+  compares selection rules at matched sparsity.
+
+## 01:20  H_rot pre-built in the harness
+
+`--rot-extra N` on `ours`: each step adds N rotated copies (90, 180, 270)
+of every image and trains a joint (class x rotation) 4*cpt row head next to
+the class head. Rows for the task are frozen under the same rule as the
+class head, refit on the masked features after the mask is chosen, and the
+closure check covers them. Routing row `rot`: mean over the four rotations
+of the max sigmoid on that rotation's rows, per circuit (CSI's ensemble
+score); `rot_cls` classifies with the rotation head; `rot_or_z` is TPL's
+energy OR gate over `rot` and `z`. Cost (1 + N)x training compute. N=3 is
+the full CSI batch composition, N=1 is what the plan runs first.
+Prediction: `rot` task-id well above `z`; if CLOM's ablation transfers, by
+10 to 20 points. Self test: trains, stays closed, resumes exactly.
+
+## 01:30  Kaggle runner and notebook
+
+`kaggle_runner.py --plan {smoke,session1,session2,session3}`: records the
+accelerator, finds CIFAR-100 under /kaggle/input or downloads it, collects
+checkpoints from re-attached earlier outputs, runs both self test suites,
+then the plan with a shared deadline (`--session-hours 11`), then prints a
+table from every results file. The notebook clones the repo and calls it.
+Nothing in any plan shortens a baseline's training.
+
+Budget estimate, unmeasured (no GPU here; the runner prints per task time):
+ResNet-18 CIFAR on 4500 images, batch 256, 300 epochs is 5,400 steps per
+task. At an assumed 60 to 90 ms per step on a P100 that is 5 to 8 min per
+task, 1 to 1.5 h per 10 task seed plus the ablation sweep (cached, minutes).
+session1 (FeCAM x3, ours x3, WSN x1) is roughly 6 to 8 h. session2 (WSN x2,
+SupSup x3, ours magnitude x3, finetune x1) roughly 10 h. session3 (rot x3
+at 2x) roughly 8 h. Total about 25 h against a 30 h weekly quota. CLOM's
+700 epoch contrastive recipe does not fit and is not scheduled.
+
+## 01:40  Local path test
+
+See the block below for the smoke plan on synthetic data, and on real
+CIFAR-100 if the download finishes.

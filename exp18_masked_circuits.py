@@ -65,7 +65,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import exp17_resnet_circuits as E17          # data loading and augmentation only
+import cil_data as E17                     # data loading and augmentation only (exp17 was never checked in)
 
 
 # =============================================================================
@@ -751,7 +751,7 @@ def collect_stats(model, task, cfg, device, gates, tukey=0.5, ridge=1e-2):
         mu = fc.mean(0)
         d = fc - mu
         cov = (d.t() @ d) / max(1, len(fc) - 1)
-        cov = cov + ridge * torch.diag(cov).mean() * torch.eye(k, device=device)
+        cov = cov + (ridge * torch.diag(cov).mean() + 1e-6) * torch.eye(k, device=device)
         prec = torch.linalg.inv(cov.double()).float()
         dist = ((d @ prec) * d).sum(1).clamp_min(0).sqrt()
         out[c] = {"mu": mu, "prec": prec,
@@ -852,11 +852,24 @@ def routing_ladder(S, y, true_task: int, device) -> Dict[str, Dict[str, float]]:
 
     def record(name, pick, cls=None):
         cls = cls_from(pick) if cls is None else cls
+        # true_task may be an int (one task's test set) or a per-image tensor
+        # (mixed batches, see cil_harness). pick and cls are kept so a caller
+        # can break the means down per task.
         out[name] = {"task_acc": float((pick == true_task).float().mean()),
-                     "class_acc": float((cls == y).float().mean())}
+                     "class_acc": float((cls == y).float().mean()),
+                     "pick": pick, "cls": cls}
 
-    # no task decision at all: concatenate every circuit's own-class scores
-    cat = torch.cat(S["own"], 1)
+    # no task decision at all: concatenate every circuit's HEAD LOGITS and
+    # take the argmax over all classes seen so far. This is what a plain
+    # multi-head network with no router does.
+    #
+    # P6 fix. The old row concatenated S["own"], our own per-class -z scores.
+    # argmax over concatenated -z picks the class of the task with the
+    # smallest z, which is exactly what the `z` row does, so the two rows
+    # printed identical numbers on every run. It was a tautology, not a
+    # baseline. Head logits are a different estimator, so this row can now
+    # differ from `z` in either direction.
+    cat = torch.cat(S["head"], 1)
     offs = torch.cat([torch.arange(lo, hi, device=device) for lo, hi in spans])
     owner = torch.cat([torch.full((hi - lo,), u, device=device,
                                   dtype=torch.long)
@@ -898,8 +911,8 @@ def routing_ladder(S, y, true_task: int, device) -> Dict[str, Dict[str, float]]:
                       for h, st in zip(S["head"], S["cal"])], 1)
     record("rownorm_mls", rn.argmax(1))
 
-    record("oracle", torch.full((len(y),), true_task, device=device,
-                                dtype=torch.long))
+    record("oracle", true_task.clone() if torch.is_tensor(true_task) else
+           torch.full((len(y),), true_task, device=device, dtype=torch.long))
     return out
 
 
