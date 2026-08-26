@@ -218,3 +218,31 @@ over HTTPS (`git -c credential.helper=... push https://github.com/AlbertoEusebio
 The remote is now set to the HTTPS URL with that helper in the repo's local
 config so the next push is one command. Copying the Windows private key
 into WSL was refused by the tool policy and not attempted further.
+
+## 01:40  Local path test, real CIFAR-100 (CPU, toy sizes)
+
+`kaggle_runner.py --plan smoke --data-dir <real cifar>` with stages
+16/32/64/128, 1500 train images per task, 3 epochs, batch 128, 2 tasks.
+This is NOT the protocol (quarter width, a third of the data, 1% of the
+epochs). It exists to prove the path on real images. 7 minutes on 12 CPU
+cores.
+
+    method   classIL last  classIL avg  taskIL last   (n=1, toy, meaningless)
+    fecam        24.0         31.0         35.8
+    ours         19.2         27.2         35.8
+    supsup       23.9         32.5         38.0
+    wsn          19.5         28.0         40.6
+
+Path checks that passed: every method trained, checkpointed, evaluated on
+mixed batches; ours closed at 0.0e+00 on both tasks; the selection
+ablation printed four rows at identical sizes; the lab loaded the
+checkpoint and its `z` row (full/train) reproduced the harness class-IL
+exactly (0.192 = 0.192); the results table printed.
+
+What the lab shows on this toy, and why it proves nothing: per task AUROC
+of the z score is 0.47 to 0.54, i.e. the undertrained circuits carry no
+task signal at all, so every routing rule sits at chance and H_calib and
+H_cross cannot be read from it. The diagnostics themselves work: own test
+z mean moves from +0.8 (train calibration) to -0.6 (val calibration),
+which is the quantity H_calib is about; it has to be read on a 300 epoch
+checkpoint.
