@@ -603,8 +603,11 @@ class WSN:
         self.net.commit()
         self.net.set_task(t)
         self.net.eval()
+        X.record_bn_stats(self.net, self.net.features, x, t)
+        X.set_bn_task(self.net, t)
         with torch.no_grad():
             f = batched(self.net.features, x)
+        X.set_bn_task(self.net, None)
         self.stats.append(fit_class_gauss(f, y, lo, hi))
         self.T_done = t + 1
         return {"loss": loss, "used_frac": self.net.used_frac()}
@@ -612,6 +615,7 @@ class WSN:
     def _feat_fn(self, t):
         def fn(b):
             self.net.set_task(t)
+            X.set_bn_task(self.net, t)
             return self.net.features(b)
         return fn
 
@@ -620,6 +624,7 @@ class WSN:
 
         def fn(b):
             self.net.set_task(t)
+            X.set_bn_task(self.net, t)
             return self.net(b)[:, lo:hi]
         return fn
 
@@ -662,13 +667,26 @@ class WSN:
     def state(self):
         return {"net": self.net.state_dict(),
                 "masks": [[m for m in w.masks] for w in self.net.wm.values()],
-                "stats": self.stats, "T_done": self.T_done}
+                "stats": self.stats, "T_done": self.T_done, "bn": X.bn_state(self.net)}
 
     def load(self, st):
         self.net.load_state_dict(st["net"])
         for w, ms in zip(self.net.wm.values(), st["masks"]):
             w.masks = list(ms)
         self.stats, self.T_done = st["stats"], st["T_done"]
+        if "bn" in st:
+            X.load_bn_state(self.net, st["bn"], self.dev)
+        self.net.eval()
+        for t in range(self.T_done):
+            if any(t not in b.stats for b in X.bn_modules(self.net)):
+                self.net.set_task(t)
+                X.record_bn_stats(self.net, self.net.features, self.tasks[t]["train"][0], t)
+                X.set_bn_task(self.net, t)
+                with torch.no_grad():
+                    f = batched(self.net.features, self.tasks[t]["train"][0])
+                lo, hi = self.tasks[t]["classes"]
+                self.stats[t] = fit_class_gauss(f, self.tasks[t]["train"][1], lo, hi)
+                X.set_bn_task(self.net, None)
 
 
 class SupSup(WSN):
@@ -700,6 +718,7 @@ class SupSup(WSN):
         for b0 in range(0, len(x), 256):
             xb = x[b0:b0 + 256]
             grs = []
+            X.set_bn_task(self.net, None)   # superposed masks have no stored stats
             for i in range(len(xb)):
                 a_i = torch.full((T,), 1.0 / T, device=x.device, requires_grad=True)
                 self.net.set_alpha(a_i)
@@ -717,6 +736,7 @@ class SupSup(WSN):
                 if bool(m.any()):
                     lo, hi = self.tasks[u]["classes"]
                     self.net.set_task(u)
+                    X.set_bn_task(self.net, u)
                     out[m] = self.net(xb[m])[:, lo:hi].argmax(1) + lo
             cls.append(out)
         pick, cls = torch.cat(pick), torch.cat(cls)
@@ -878,6 +898,7 @@ def rot_scores(model, x, masks, spans, batch=512):
     for t, (lo, hi) in enumerate(spans):
         cpt = hi - lo
         acc_c = torch.zeros(len(x), cpt, device=x.device)
+        X.set_bn_task(model, t)
         for r in range(4):
             xr = torch.rot90(x, r, dims=(2, 3)) if r else x
             lg = torch.cat([model.rot_logits(xr[s:s + batch], masks[t])[:, 4 * lo:4 * hi]
@@ -886,6 +907,7 @@ def rot_scores(model, x, masks, spans, batch=512):
             score[:, t] += p.max(1).values / 4
             acc_c += p
         cls.append(acc_c)
+    X.set_bn_task(model, None)
     return score, cls
 
 
@@ -919,6 +941,7 @@ class Ours:
         task = self.tasks[t]
         lo, hi = task["classes"]
         snap = self.model.head.weight.detach().clone()
+        X.set_bn_task(self.model, None)     # alternative masks have no stored stats
         X.head_refit(self.model, task, self.xcfg, self.dev, gates_alt,
                      self.cfg.head_refit_steps, self.seed * 3 + t)
         v = X.acc_task(self.model, task, self.xcfg, self.dev, "val", gates_alt)
@@ -951,6 +974,10 @@ class Ours:
             rnd = X.random_gates(m, kept, self.dev, self.seed * 13 + t)
             alts = {"magnitude": mag, "learned": lrn, "random": rnd}
         chosen = gates if cfg.select == "causal" else alts[cfg.select]
+        # the circuit's own BN statistics, from its TRAINING data under its
+        # mask. From here on everything for task t is single sample.
+        X.record_bn_stats(m, lambda b: m.features(b, chosen), task["train"][0], t)
+        X.set_bn_task(m, t)
         # head refit on the chosen mask (this is what the run commits to)
         if cfg.head_refit_steps:
             X.head_refit(m, task, self.xcfg, self.dev, chosen,
@@ -982,6 +1009,7 @@ class Ours:
         self.stats.append(X.collect_stats(m, task, self.xcfg, self.dev, chosen))
         cc = X.closure_check(m, task, self.xcfg, self.dev, self.frozen, chosen,
                              self.seed * 17 + t)
+        X.set_bn_task(m, None)
         tr.pop("scorer", None)
         row = {"task": t, "bce_last": tr["bce_last"], "full_acc": ps["full_acc"],
                "n_channels": int(sum(int(g.sum()) for g in chosen)),
@@ -1053,19 +1081,41 @@ class Ours:
                 for r, v in L.items():
                     rows.setdefault(r, []).append(
                         {"task_acc": v["task_acc"], "class_acc": v["class_acc"]})
+                X.set_bn_task(self.model, s)
                 til.append(X.acc_task(self.model, self.tasks[s], self.xcfg,
                                       self.dev, "test", self.masks[s]))
+                X.set_bn_task(self.model, None)
         cil = [rows["z"][s]["class_acc"] for s in range(t + 1)]
         return {"til": til, "cil": cil, "ladder": rows}
 
     def state(self):
         return {"model": self.model.state_dict(), "frozen": self.frozen,
-                "masks": self.masks, "stats": self.stats, "per_task": self.per_task}
+                "masks": self.masks, "stats": self.stats, "per_task": self.per_task,
+                "bn": X.bn_state(self.model)}
 
     def load(self, st):
         self.model.load_state_dict(st["model"])
         self.frozen, self.masks = st["frozen"], st["masks"]
         self.stats, self.per_task = st["stats"], st["per_task"]
+        if "bn" in st:
+            X.load_bn_state(self.model, st["bn"], self.dev)
+        self.ensure_bn_stats()
+
+    def ensure_bn_stats(self):
+        """Checkpoints written before TaskBN existed have no stored stats.
+        Recording them now from training data is the same computation the
+        task would have run at the time, because the circuit is closed."""
+        m = self.model
+        have = set().union(*[set(b.stats) for b in X.bn_modules(m)]) if X.bn_modules(m) else set()
+        for t, gates in enumerate(self.masks):
+            if t not in have:
+                X.record_bn_stats(m, lambda b, g=gates: m.features(b, g),
+                                  self.tasks[t]["train"][0], t)
+                # per class Gaussians were fitted in batch mode; refit them
+                # in stored mode so train and test features agree
+                X.set_bn_task(m, t)
+                self.stats[t] = X.collect_stats(m, self.tasks[t], self.xcfg, self.dev, gates)
+                X.set_bn_task(m, None)
 
 
 METHODS = {"finetune": Finetune, "fecam": FeCAM, "wsn": WSN,
@@ -1300,6 +1350,30 @@ def self_test():
         assert np.array_equal(np.array(res["cil_matrix"]), np.array(r["cil_matrix"]), equal_nan=True)
         print(f"[3b:ours+rot] rotation head trains, circuits stay closed, rot rows "
               f"present ({r['ladder_last']['rot']:.3f}), resume exact")
+    # 5. single sample inference: an image scored alone equals the same image
+    #    scored inside a batch, for every circuit (stored BN statistics)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        cfg = HCfg(method="ours", **base)
+        run_seed(cfg, tasks, dev, 0, td / "a", td / "ca", [], 0)
+        ck = torch.load(td / "ca" / "ours_seed0.pt", weights_only=False)
+        o = Ours(cfg, tasks, dev, 0); o.load(ck["method"]); o.model.eval()
+        xb = tasks[1]["test"][0][:16]
+        worst = 0.0
+        with torch.no_grad():
+            for t_, g_ in enumerate(o.masks):
+                X.set_bn_task(o.model, t_)
+                fb = o.model.features(xb, g_)
+                f1 = torch.cat([o.model.features(xb[i:i + 1], g_) for i in range(len(xb))])
+                worst = max(worst, float((fb - f1).abs().max()))
+            X.set_bn_task(o.model, None)
+            fbatch = o.model.features(xb, o.masks[0])
+            fsingle = o.model.features(xb[:1], o.masks[0])
+        assert worst < 1e-5, f"batch dependence with stored stats: {worst}"
+        assert not torch.allclose(fbatch[:1], fsingle), \
+            "batch-statistics mode is not batch dependent; the control is vacuous"
+        print(f"[5] with stored per-task BN statistics an image alone and in a batch of 16 "
+              f"differ by {worst:.1e}; in batch-statistics mode they differ (control)")
     # 4. ours: selection alternatives are reported at matched size
     print("[4] selection ablation rows present:",
           [a["name"] for a in full["per_task"][0]["ablation"]])

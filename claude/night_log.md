@@ -298,3 +298,45 @@ Session1 (version 5) cloned the repo before this fix, so its in-session
 lab output is test-scored. The lab is offline, so I will re-run it here on
 the fetched checkpoints with the fixed code; those are the numbers that
 count.
+
+## 10:00  Admissibility audit (owner: "avoid any inadmissible ML")
+
+Went through every path a reviewer could call inadmissible.
+
+Found and fixed: test time BatchNorm used the statistics of the test
+batch. exp18 copied WSN's `track_running_stats=False`, so a test image's
+prediction depended on the other images in its batch (transductive, not
+single sample). Mixed batches removed the task id leak but not this. Fix:
+`TaskBN` in exp18. When a task's mask is committed, one pass of that
+task's TRAINING images under the mask records per layer mean and var,
+stored per task inside the frozen circuit, written once (a second write
+raises). At test time circuit t normalises every image with its own stored
+statistics. Self test [5]: an image alone and inside a batch of 16 differ
+by 2.0e-06 with stored statistics, and differ materially in batch mode
+(the control). Class Gaussians are fitted in the stored mode so train and
+test features agree. Wired through ours, WSN, SupSup, the lab, and
+`rot_scores`. FeCAM and finetune already used running statistics.
+
+Session1 (version 5) runs the old evaluator. Its checkpoints are still
+valid: masks, weights and per task data are what they are, and the closed
+circuits mean the stored statistics computed now equal what the task would
+have recorded then. `reeval.py` rebuilds the incremental matrices step by
+step with the admissible evaluator (masks 0..t only at step t) and writes
+`*_reeval_results.jsonl`, never overwriting the originals. The reported
+numbers for session1 will be the re-evaluated ones, labelled.
+
+Checked and left as is, with the reason:
+- Validation slice comes from CIFAR train (`cil_data.prepare_data`), 50
+  per class, fixed seed; test never enters any fit, gate, or selection.
+- Routing rules are selected on the validation half, test is report only
+  (09:30 block). `batch50` is unselectable.
+- SupSup's one shot inference is per image; its superposed masks have no
+  stored statistics so it runs in batch mode, but on single images.
+- The selection ablation's alternative masks are scored in batch mode on
+  val and test at training time; they are measurements, not the committed
+  circuit, and the committed one is scored single sample.
+- Head refit, Gaussian fits, closure check, calibration: training data or
+  the validation slice only.
+- No early stopping, no best of N seeds, no hyperparameter chosen on test.
+Remaining caveat, unchanged: the validation slice gates the ablation and
+also calibrates. Not a test leak; mildly optimistic calibration.

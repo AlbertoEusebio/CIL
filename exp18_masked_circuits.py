@@ -72,12 +72,94 @@ import cil_data as E17                     # data loading and augmentation only 
 # model
 # =============================================================================
 
+class TaskBN(nn.Module):
+    """BatchNorm with no running statistics during training (WSN's choice)
+    and, at test time, PER TASK statistics recorded once from that task's
+    own TRAINING data under its mask (`record_bn_stats`). With `use` unset
+    it normalises with the current batch, which is transductive: a test
+    image's output then depends on the other images in its batch. With
+    `use = t` every image is normalised by task t's stored mean and var, so
+    inference is single sample. The stored stats are written once per task
+    and are part of the closed circuit."""
+
+    def __init__(self, c, affine: bool, eps: float = 1e-5):
+        super().__init__()
+        self.num_features = c
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(c))
+            self.bias = nn.Parameter(torch.zeros(c))
+        else:
+            self.weight = self.bias = None
+        self.stats: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.use: Optional[int] = None
+        self._acc = None
+
+    def forward(self, x):
+        if self._acc is not None:                      # recording pass
+            n = x.numel() // x.shape[1]
+            self._acc[0] += x.sum((0, 2, 3)).double()
+            self._acc[1] += x.pow(2).sum((0, 2, 3)).double()
+            self._acc[2] += n
+        if self.training or self.use is None or self.use not in self.stats:
+            return F.batch_norm(x, None, None, self.weight, self.bias, True,
+                                0.0, self.eps)
+        m, v = self.stats[self.use]
+        return F.batch_norm(x, m, v, self.weight, self.bias, False, 0.0, self.eps)
+
+
 def _bn(c, per_task_bn: bool):
-    """WSN's choice: no affine parameters, no running statistics. Nothing per
-    channel to freeze, nothing to go stale. See the module docstring."""
-    if per_task_bn:
-        return nn.BatchNorm2d(c, track_running_stats=False, affine=True)
-    return nn.BatchNorm2d(c, track_running_stats=False, affine=False)
+    """No running statistics; affine only with --per-task-bn. Test time
+    normalisation is per task, see TaskBN."""
+    return TaskBN(c, affine=bool(per_task_bn))
+
+
+def bn_modules(model):
+    return [m for m in model.modules() if isinstance(m, TaskBN)]
+
+
+def set_bn_task(model, t: Optional[int]):
+    """t = None: batch statistics (transductive, training time only).
+    t = task index: that task's stored statistics, single sample."""
+    for m in bn_modules(model):
+        m.use = t
+
+
+@torch.no_grad()
+def record_bn_stats(model, forward, x, t: int, batch: int = 512, overwrite=False):
+    """One pass of task t's TRAINING images (x) through `forward` (which must
+    apply task t's mask) accumulating per layer mean and variance. Stored
+    under key t in every TaskBN. Written once; a second call for the same
+    task is an error unless overwrite=True, so a later task can never touch
+    an earlier circuit's statistics."""
+    mods = bn_modules(model)
+    for m in mods:
+        if t in m.stats and not overwrite:
+            raise RuntimeError(f"BN stats for task {t} already recorded")
+        m._acc = [torch.zeros(m.num_features, dtype=torch.float64, device=x.device),
+                  torch.zeros(m.num_features, dtype=torch.float64, device=x.device), 0]
+    was = model.training
+    model.eval()
+    set_bn_task(model, None)          # batch statistics during the pass itself
+    for s in range(0, len(x), batch):
+        forward(x[s:s + batch])
+    for m in mods:
+        S1, S2, n = m._acc
+        mean = S1 / n
+        var = (S2 / n - mean * mean).clamp_min(0)
+        m.stats[t] = (mean.float(), var.float())
+        m._acc = None
+    model.train(was)
+
+
+def bn_state(model):
+    return [{k: (v[0].cpu(), v[1].cpu()) for k, v in m.stats.items()} for m in bn_modules(model)]
+
+
+def load_bn_state(model, st, device):
+    for m, d in zip(bn_modules(model), st):
+        m.stats = {int(k): (v[0].to(device), v[1].to(device)) for k, v in d.items()}
 
 
 class Block(nn.Module):
@@ -788,6 +870,7 @@ def task_scores(model, x, stats, tasks_done, batch=512):
     zraw = torch.full((len(x), T), float("inf"), device=dev)
     own, head, cal = [None] * T, [None] * T, [None] * T
     for t, (gates, st, lo, hi) in enumerate(tasks_done):
+        set_bn_task(model, t)          # single sample inference for circuit t
         f = torch.cat([model.features(x[s:s + batch], gates)[:, st["keep"]]
                        for s in range(0, len(x), batch)])
         if st["tukey"]:
@@ -806,6 +889,7 @@ def task_scores(model, x, stats, tasks_done, batch=512):
         head[t] = torch.cat([model(x[s:s + batch], gates)[:, lo:hi]
                              for s in range(0, len(x), batch)])
         cal[t] = st
+    set_bn_task(model, None)
     return {"z": z, "zraw": zraw, "own": own, "head": head, "cal": cal,
             "spans": [(lo, hi) for _, _, lo, hi in tasks_done]}
 

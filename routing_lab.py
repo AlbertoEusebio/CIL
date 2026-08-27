@@ -67,10 +67,15 @@ import exp18_masked_circuits as X
 
 
 @torch.no_grad()
-def feats_under(model, x, gates, batch=512):
+def feats_under(model, x, gates, batch=512, task=None):
+    """Features under `gates`, normalised with that circuit's stored BN
+    statistics (single sample). `task` is the circuit index; masks are
+    passed by position so callers give it explicitly."""
+    X.set_bn_task(model, task)
     keep = gates[-1].bool()
     f = torch.cat([model.features(x[s:s + batch], gates)[:, keep]
                    for s in range(0, len(x), batch)])
+    X.set_bn_task(model, None)
     return f.clamp_min(0).pow(0.5)          # Tukey 0.5, as exp18
 
 
@@ -167,13 +172,13 @@ def evaluate_step(model, tasks, masks, t, cov_model, x, y, tt, calib="train"):
     # class Gaussians of every task u >= m inside space m
     G, BG = {}, {}
     for m in range(T):
-        ftr = torch.cat([feats_under(model, tasks[u]["train"][0], masks[m]) for u in range(m, T)])
+        ftr = torch.cat([feats_under(model, tasks[u]["train"][0], masks[m], task=m) for u in range(m, T)])
         ytr = torch.cat([tasks[u]["train"][1] for u in range(m, T)])
         classes = [c for u in range(m, T) for c in range(*spans[u])]
         fcal = ycal = None
         if calib == "val":
             # calibration half only; the other half is the selection set
-            fcal = torch.cat([feats_under(model, val_half(tasks[u], "calib")[0], masks[m]) for u in range(m, T)])
+            fcal = torch.cat([feats_under(model, val_half(tasks[u], "calib")[0], masks[m], task=m) for u in range(m, T)])
             ycal = torch.cat([val_half(tasks[u], "calib")[1] for u in range(m, T)])
         G[m] = fit_space(ftr, ytr, classes, cov_model, fcal=fcal, ycal=ycal)
         # background Gaussian of task m's OWN data in its own space, for the
@@ -181,7 +186,7 @@ def evaluate_step(model, tasks, masks, t, cov_model, x, y, tt, calib="train"):
         own = ftr[(ytr >= spans[m][0]) & (ytr < spans[m][1])]
         BG[m] = fit_space(own, torch.zeros(len(own), dtype=torch.long, device=own.device),
                           [0], "full" if cov_model in ("full", "fecam", "shared") else "diag")[0]
-    fte = {m: feats_under(model, x, masks[m]) for m in range(T)}
+    fte = {m: feats_under(model, x, masks[m], task=m) for m in range(T)}
     # z_{m,c}(x) for every space m and every class c known to it
     Z = {}
     for m in range(T):
