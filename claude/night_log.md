@@ -259,3 +259,17 @@ kernels. The brief's "P100 or 2x T4, pick one" is now decided by the
 image: T4 only (sm_75). Re-pushed with `--accelerator NvidiaTeslaT4`.
 Budget consequence: a T4 is roughly half a P100 in fp32, so the per task
 estimates in the 01:30 block should be read at 2x until measured.
+
+## 09:10  Smoke run passed on T4, session1 launched
+
+Version 3 (T4, `fedesoriano/cifar100` attached, no download): both self
+test suites, then fecam, ours, lab, wsn, supsup on 2 tasks x 2 epochs. All
+closed at 0.0e+00, checkpoints and results persisted under
+/kaggle/working. Timing: `ours` spent 138 s and 128 s per task with only 36
+training steps, so about 2 min per task is fixed overhead (ablation sweep
+over 960 channels, learned gate fit, four head refits, evaluation). The
+training cost at 300 epochs (5,400 steps per task) is on top of that.
+
+Version 4 = `--plan session1` on the T4 with an 11 h deadline: FeCAM
+x3, ours x3 (lab after each), WSN x1. Toy numbers from the smoke run are
+not recorded here; 2 epochs say nothing.
