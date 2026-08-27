@@ -43,30 +43,30 @@ FECAM = "--method fecam --opt sgd --lr 0.1 --weight-decay 5e-4 --sched cos"
 FT = "--method finetune --opt sgd --lr 0.1 --weight-decay 5e-4 --sched cos"
 
 PLANS = {
-    # Phase A/B/C. FeCAM first: it is the cheapest sanity floor (one task of
-    # training). Then ours on 3 seeds, then WSN.
+    # One seed per arm at this stage (owner's call, 2026-08-27): decide what
+    # works first, add seeds to what survives. Every number is n=1 until
+    # session4 exists.
     "session1": [
-        ("harness", f"{FECAM} --seeds 0,1,2"),
+        ("harness", f"{FECAM} --seeds 0"),
         ("harness", f"{OURS} --seeds 0"),
         ("lab", "ours_seed0.pt"),
-        ("harness", f"{OURS} --seeds 1"),
-        ("lab", "ours_seed1.pt"),
-        ("harness", f"{OURS} --seeds 2"),
-        ("lab", "ours_seed2.pt"),
         ("harness", f"{WSN} --seeds 0"),
+        ("harness", f"{SUP} --seeds 0"),
     ],
-    # Phase B remainder and the full-run selection ablation.
+    # full-run selection ablation and the lower bound
     "session2": [
-        ("harness", f"{WSN} --seeds 1,2"),
-        ("harness", f"{SUP} --seeds 0,1,2"),
-        ("harness", f"{OURS} --select magnitude --seeds 0,1,2"),
+        ("harness", f"{OURS} --select magnitude --seeds 0"),
         ("harness", f"{FT} --seeds 0"),
     ],
     # Phase D. H_rot: rotation-as-OOD head, 2x training compute per task.
     "session3": [
         ("harness", f"{OURS} --rot-extra 1 --seeds 0"),
         ("lab", "ours_seed0.pt"),
-        ("harness", f"{OURS} --rot-extra 1 --seeds 1,2"),
+    ],
+    # confirmatory seeds for whatever survived, on fresh seeds
+    "session4": [
+        ("harness", f"{FECAM} --seeds 1,2"),
+        ("harness", f"{OURS} --seeds 1,2"),
     ],
     # 2-task toy on the real data: tests the whole path in minutes.
     "smoke": [

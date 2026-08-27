@@ -340,3 +340,13 @@ Checked and left as is, with the reason:
 - No early stopping, no best of N seeds, no hyperparameter chosen on test.
 Remaining caveat, unchanged: the validation slice gates the ablation and
 also calibrates. Not a test leak; mildly optimistic calibration.
+
+## 10:20  One seed per arm
+
+Owner: three seeds at this stage are too many, use one. Plans rewritten:
+session1 = FeCAM, ours (+lab), WSN, SupSup, all seed 0; session2 =
+magnitude selection, finetune; session3 = rotation head; session4 =
+seeds 1,2 for whatever survives. Every number is n=1 until session4.
+Version 5 (three seed plan, old evaluator) cannot be cancelled from the
+CLI; owner asked to cancel it in the UI. Version 6 pushed with the new
+plan and the single sample evaluator.
