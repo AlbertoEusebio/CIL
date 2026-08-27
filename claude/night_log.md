@@ -350,3 +350,24 @@ seeds 1,2 for whatever survives. Every number is n=1 until session4.
 Version 5 (three seed plan, old evaluator) cannot be cancelled from the
 CLI; owner asked to cancel it in the UI. Version 6 pushed with the new
 plan and the single sample evaluator.
+
+## 10:50  Harness check: FeCAM (from version 5, 3 seeds, owner pasted the log)
+
+    fecam  n=3  seeds 0,1,2   classIL_last 0.3170 +/- 0.0067
+                              classIL_avg  0.4544 +/- 0.0054
+                              taskIL_last  0.6617 +/- 0.0052
+                              F_taskIL 0.0000   F_classIL 0.0999
+
+Published, same protocol: 32.4 / 48.3 (AdaGauss Table 1), 37.63 / 52.53
+(EFC++ Table 2). Last accuracy within a point of the lower figure. Average
+incremental 3 points under it, which is inside the cross paper spread but
+is a deficit; the likely cause is the task 0 recipe (SGD 0.1 cosine, 300
+epochs, crop+flip) versus PyCIL's, since FeCAM's early steps are the task
+0 backbone. Valid despite coming from version 5: FeCAM uses running
+statistics BN, untouched by the TaskBN fix. F_taskIL = 0 confirms the
+backbone never moved; the 0.10 in F_classIL is label space growth only.
+
+Timing on the T4: 57 min for three 300 epoch task trainings, so about 19
+min per task. A 10 task `ours` seed is roughly 3.5 to 4 h with the
+ablation overhead. Session1 (v6) should complete FeCAM, ours and WSN and
+stop cleanly inside SupSup.
