@@ -32,6 +32,12 @@ Rows:
     pairwise     every pair (s < u) decided in space s; most wins picks the task
     allspace_min class score = min over spaces m <= task(c) of z_{m,c}
     allspace_mean                same with the mean
+Selection versus reporting. The per task validation slice (held out of
+TRAIN, never test) is split per class into a calibration half and a
+selection half. Rules are compared, and a winner named, on a mixed stream
+of the selection half. Test accuracies are printed next to them and are
+report-only; nothing is chosen on them.
+
 Each row is run for every covariance model in --cov (full per class, fecam
 = shrinkage + correlation normalisation, shared per task, diag) and for
 every calibration source in --calib (train: z mean/std from the fitting
@@ -66,6 +72,33 @@ def feats_under(model, x, gates, batch=512):
     f = torch.cat([model.features(x[s:s + batch], gates)[:, keep]
                    for s in range(0, len(x), batch)])
     return f.clamp_min(0).pow(0.5)          # Tukey 0.5, as exp18
+
+
+def val_half(task, which):
+    """Split a task's validation slice per class into a calibration half
+    and a selection half. Neither is test data. Rules are chosen on the
+    selection half; test is report-only."""
+    x, y = task["val"]
+    lo, hi = task["classes"]
+    keep = []
+    for c in range(lo, hi):
+        idx = (y == c).nonzero(as_tuple=True)[0]
+        h = len(idx) // 2
+        keep.append(idx[:h] if which == "calib" else idx[h:])
+    keep = torch.cat(keep)
+    return x[keep], y[keep]
+
+
+def mixed_split(tasks, t, which, seed=0):
+    xs, ys, ts = [], [], []
+    for s_ in range(t + 1):
+        x, y = val_half(tasks[s_], which) if which else tasks[s_]["test"]
+        xs.append(x); ys.append(y)
+        ts.append(torch.full((len(x),), s_, device=x.device, dtype=torch.long))
+    x, y, tt = torch.cat(xs), torch.cat(ys), torch.cat(ts)
+    g = torch.Generator().manual_seed(seed)
+    p = torch.randperm(len(x), generator=g).to(x.device)
+    return x[p], y[p], tt[p]
 
 
 @torch.no_grad()
@@ -139,8 +172,9 @@ def evaluate_step(model, tasks, masks, t, cov_model, x, y, tt, calib="train"):
         classes = [c for u in range(m, T) for c in range(*spans[u])]
         fcal = ycal = None
         if calib == "val":
-            fcal = torch.cat([feats_under(model, tasks[u]["val"][0], masks[m]) for u in range(m, T)])
-            ycal = torch.cat([tasks[u]["val"][1] for u in range(m, T)])
+            # calibration half only; the other half is the selection set
+            fcal = torch.cat([feats_under(model, val_half(tasks[u], "calib")[0], masks[m]) for u in range(m, T)])
+            ycal = torch.cat([val_half(tasks[u], "calib")[1] for u in range(m, T)])
         G[m] = fit_space(ftr, ytr, classes, cov_model, fcal=fcal, ycal=ycal)
         # background Gaussian of task m's OWN data in its own space, for the
         # relative Mahalanobis distance (Ren et al. 2021)
@@ -297,32 +331,50 @@ def main():
     for cov in args.cov.split(","):
       for calib in args.calib.split(","):
         key = f"{cov}/{calib}"
-        per_step = []
+        per_step, per_step_test = [], []
         for t in steps:
-            x, y, tt = H.mixed_test(tasks, t)
             t0 = time.time()
-            res, store = evaluate_step(model, tasks, masks, t, cov, x, y, tt, calib)
+            xs, ys, tts = mixed_split(tasks, t, "select")
+            res, store = evaluate_step(model, tasks, masks, t, cov, xs, ys, tts, calib)
             per_step.append(res)
+            xt, yt, ttt = mixed_split(tasks, t, None)
+            res_t, _ = evaluate_step(model, tasks, masks, t, cov, xt, yt, ttt, calib)
+            per_step_test.append(res_t)
             print(f"  {key:>12} after task {t} ({time.time()-t0:.0f}s, "
-                  f"{store/1e6:.2f}M floats):  " +
+                  f"{store/1e6:.2f}M floats)", flush=True)
+            print(f"  {'SELECT (val half)':>20}: " +
                   "  ".join(f"{r}:{v['task_acc']:.3f}/{v['class_acc']:.3f}"
                             for r, v in res.items() if not r.startswith("_")), flush=True)
+            print(f"  {'TEST (report only)':>20}: " +
+                  "  ".join(f"{r}:{v['task_acc']:.3f}/{v['class_acc']:.3f}"
+                            for r, v in res_t.items() if not r.startswith("_")), flush=True)
             d = res["_diag"]
-            print(f"  {'':>12} z-score diagnostics per task: AUROC " +
+            print(f"  {'':>20}  z diagnostics on the selection half: AUROC " +
                   " ".join(f"{d[u]['auroc']:.2f}" for u in d) +
-                  " | own-test z mean " +
+                  " | own z mean " +
                   " ".join(f"{d[u]['own_test_z_mean']:+.1f}" for u in d), flush=True)
         rows = [r for r in per_step[-1] if not r.startswith("_")]
         summary = {r: {"task_last": per_step[-1][r]["task_acc"],
                        "class_last": per_step[-1][r]["class_acc"],
-                       "class_avg": float(np.mean([p[r]["class_acc"] for p in per_step]))}
+                       "class_avg": float(np.mean([p[r]["class_acc"] for p in per_step])),
+                       "test_task_last": per_step_test[-1][r]["task_acc"],
+                       "test_class_last": per_step_test[-1][r]["class_acc"],
+                       "test_class_avg": float(np.mean([p[r]["class_acc"] for p in per_step_test]))}
                    for r in rows}
-        results[key] = {"summary": summary, "steps": per_step, "store_floats": store}
-        print(f"\n  {key}  {'row':>14} {'task-id':>8} {'classIL last':>13} {'classIL avg':>12}")
+        results[key] = {"summary": summary, "steps": per_step, "steps_test": per_step_test,
+                        "store_floats": store}
+        print(f"\n  {key}  {'row':>14} | SELECT half: {'task-id':>7} {'cIL last':>8} {'cIL avg':>8} "
+              f"| TEST: {'task-id':>7} {'cIL last':>8} {'cIL avg':>8}")
         for r, v in summary.items():
-            print(f"  {'':>10}  {r:>14} {v['task_last']:>8.4f} {v['class_last']:>13.4f} "
-                  f"{v['class_avg']:>12.4f}")
-        print(f"  chance task-id {1.0/T_done:.4f}; harness z row for this ckpt: "
+            print(f"  {'':>10}  {r:>14} | {v['task_last']:>19.4f} {v['class_last']:>8.4f} {v['class_avg']:>8.4f} "
+                  f"| {v['test_task_last']:>13.4f} {v['test_class_last']:>8.4f} {v['test_class_avg']:>8.4f}")
+        best = max(rows, key=lambda r: summary[r]["class_avg"])
+        print(f"  {'':>10}  selected on the val half: {best}  (test cIL last "
+              f"{summary[best]['test_class_last']:.4f}); batch50 is a diagnostic, never selectable"
+              if best != "batch50" else
+              f"  {'':>10}  best on val half is batch50, a diagnostic; next best: "
+              f"{max([r for r in rows if r != 'batch50'], key=lambda r: summary[r]['class_avg'])}")
+        print(f"  chance task-id {1.0/T_done:.4f}; harness z row (test) for this ckpt: "
               f"{np.nanmean(np.array(ck['cil'])[T_done-1, :T_done]):.4f}")
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

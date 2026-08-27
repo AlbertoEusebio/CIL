@@ -273,3 +273,28 @@ training cost at 300 epochs (5,400 steps per task) is on top of that.
 Version 4 = `--plan session1` on the T4 with an 11 h deadline: FeCAM
 x3, ours x3 (lab after each), WSN x1. Toy numbers from the smoke run are
 not recorded here; 2 epochs say nothing.
+
+## 09:30  Owner's leak call on H_calib, and the fix
+
+The owner said H_calib leaks the test set. Checked: calibration reads
+`tasks[u]["val"]`, which `cil_data.prepare_data` cuts from the CIFAR
+training set, never from test. But the lab compared every routing rule on
+the test stream and I intended to promote the winner. Choosing a rule by
+test accuracy is tuning on test, whatever the calibration data is. That
+was the leak, and the owner was right to stop it.
+
+Fix in `routing_lab.py`: the 50 validation images per class are split per
+class into a calibration half (25) and a selection half (25). `--calib
+val` fits `m, s` on the calibration half only. Every rule is scored on a
+mixed stream of the selection half, and the winner is named there. Test is
+printed beside it and labelled report-only. `batch50` can never be
+selected. Remaining caveat, stated: the same validation slice gates the
+causal ablation, so a circuit was chosen partly for doing well on it and
+calibration statistics from it are mildly optimistic. A cleaner split
+(ablation slice / calibration slice / selection slice) needs a larger
+held out set and is a session2 change if H_calib matters at all.
+
+Session1 (version 5) cloned the repo before this fix, so its in-session
+lab output is test-scored. The lab is offline, so I will re-run it here on
+the fetched checkpoints with the fixed code; those are the numbers that
+count.
