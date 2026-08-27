@@ -246,3 +246,16 @@ H_cross cannot be read from it. The diagnostics themselves work: own test
 z mean moves from +0.8 (train calibration) to -0.6 (val calibration),
 which is the quantity H_calib is about; it has to be read on a 300 epoch
 checkpoint.
+
+## 08:35  Kaggle access, and the P100 is dead for PyTorch
+
+The owner put a Kaggle API token in `.env`. `kaggle kernels push` works, so
+runs can now be launched and fetched from here.
+
+Smoke run, version 2, on the P100: both self test suites passed on CPU,
+then every GPU run died with `CUDA error: no kernel image is available for
+execution on the device`. Kaggle's current PyTorch build has no sm_60
+kernels. The brief's "P100 or 2x T4, pick one" is now decided by the
+image: T4 only (sm_75). Re-pushed with `--accelerator NvidiaTeslaT4`.
+Budget consequence: a T4 is roughly half a P100 in fp32, so the per task
+estimates in the 01:30 block should be read at 2x until measured.
