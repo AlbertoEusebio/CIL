@@ -3,3 +3,4 @@ ckpt/
 data/
 __pycache__/
 *.pyc
+.env

@@ -92,8 +92,8 @@ def find_cifar():
         if (Path(p) / "train").exists():
             return str(Path(p).parent)
     for p in glob.glob("/kaggle/input/**/train", recursive=True):
-        if "cifar" in p.lower() and (Path(p).parent / "meta").exists():
-            return str(Path(p).parent.parent)
+        if (Path(p).parent / "meta").exists() and (Path(p).parent / "test").exists():
+            return str(Path(p).parent)      # cil_data accepts the folder itself
     return None
 
 
